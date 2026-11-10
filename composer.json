@@ -1,0 +1,8 @@
+{
+    "name": "testchat/chat",
+    "description": "Простой онлайн-чат на PHP, Redis и Vue 2",
+    "require": {
+        "php": ">=8.1",
+        "predis/predis": "^2.2"
+    }
+}
