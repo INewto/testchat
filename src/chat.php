@@ -87,7 +87,8 @@ LUA;
  * KEYS: 1=seq, 2=messages, 3=timeline, 4=payloads, 5=online, 6=leaving,
  *       7=reap
  * ARGV: 1=uid, 2=имя, 3=сейчас в мс, 4=TTL пульса, 5=grace в мс,
- *       6=префикс ключа пульса, 7=интервал уборки в секундах
+ *       6=префикс ключа пульса, 7=интервал уборки в секундах,
+ *       8=граница чистки истории в мс (сейчас минус CHAT_HISTORY_MS)
  */
 function chat_presence(Client $redis, string $uid, string $name): void
 {
@@ -160,6 +161,17 @@ end
 --    Касание текущего uid выше выполняется всегда, уборка может подождать.
 local claimed = redis.call('SET', KEYS[7], '1', 'NX', 'EX', ARGV[7])
 if claimed and claimed.ok then
+    -- Чистка старья: раз в секунду глобально, в том же EVAL, что и уборка.
+    -- Удаляем из ТРЁХ структур сразу. Если вычистить только payloads, в
+    -- chat:messages останутся seq без данных: ветка since промолчит про них
+    -- и при пустом батче перескочит курсор на общий chat:seq, потеряв хвост.
+    local stale = redis.call('ZRANGEBYSCORE', KEYS[3], '-inf', '(' .. ARGV[8])
+    for i = 1, #stale do
+        redis.call('ZREM', KEYS[3], stale[i])
+        redis.call('ZREM', KEYS[2], stale[i])
+        redis.call('HDEL', KEYS[4], stale[i])
+    end
+
     local users = redis.call('HGETALL', KEYS[5])
     for i = 1, #users, 2 do
         local user = users[i]
@@ -189,6 +201,8 @@ end
 return 1
 LUA;
 
+    $now = chat_now_ms();
+
     $redis->eval(
         $script,
         7,
@@ -201,11 +215,12 @@ LUA;
         CHAT_REAP,
         $uid,
         $name,
-        chat_now_ms(),
+        $now,
         CHAT_PRESENCE_TTL,
         CHAT_LEAVE_GRACE_MS,
         CHAT_SEEN_PREFIX,
-        CHAT_REAP_INTERVAL
+        CHAT_REAP_INTERVAL,
+        (string) ($now - CHAT_HISTORY_MS)
     );
 }
 
@@ -302,7 +317,8 @@ function chat_is_present(Client $redis, string $uid): bool
  * Исключение доходит до catch (Throwable) в public/api.php: запись в лог
  * и 500 JSON. Клиент при такой ошибке не вызывает applyData(), хранит
  * прежние since и epoch и через интервал опроса повторяет тот же запрос;
- * ретрай на сервере не нужен.
+ * ретрай на сервере не нужен. Битая строка ОДНОГО сообщения под контракт
+ * не подпадает: она пропускается с записью в лог, ответ остаётся полным.
  */
 function chat_snapshot(Client $redis, ?int $since): array
 {
@@ -378,13 +394,10 @@ if ARGV[1] ~= 'history' and #seqs > 0 then
     cursor = seqs[#seqs]
 end
 
-return cjson.encode({
-    epoch = epoch,
-    seq = cursor,
-    seqs = seqs,
-    payloads = payloads,
-    users = redis.call('HVALS', KEYS[6])
-})
+-- Конверт через cjson НЕ собираем: сырой байт из любого payload попал бы
+-- в него как есть и повалил бы json_decode ВСЕГО ответа. Таблица уходит
+-- RESP-массивом: каждая строка лежит отдельно и гасится поштучно в PHP.
+return { epoch, cursor, seqs, payloads, redis.call('HVALS', KEYS[6]) }
 LUA;
 
     $raw = $redis->eval(
@@ -404,28 +417,33 @@ LUA;
     );
 
     /*
-     * Три проверки ниже — намеренный отказ от частичного ответа, а не место
-     * для fallback. Про исключение, 500 и ретрай с тем же since смотри
-     * контракт в комментарии к chat_snapshot().
+     * Ответ — RESP-массив из пяти элементов, а не один JSON-конверт: битый
+     * байт в отдельном сообщении не валит разбор всего ответа. Проверки ниже —
+     * намеренный отказ от частичного ответа, а не место для fallback. Про
+     * исключение, 500 и ретрай с тем же since смотри контракт в комментарии
+     * к chat_snapshot().
      */
-    $data = json_decode((string) $raw, true);
-    if (!is_array($data)) {
+    if (!is_array($raw)) {
         throw new RuntimeException('Не удалось разобрать состояние чата из Redis');
     }
-    if (!isset($data['epoch']) || !is_string($data['epoch']) || $data['epoch'] === '') {
+    if (!isset($raw[0]) || !is_string($raw[0]) || $raw[0] === '' || !mb_check_encoding($raw[0], 'UTF-8')) {
         throw new RuntimeException('В Redis отсутствует идентификатор чата');
     }
-    if (!isset($data['seq']) || !is_numeric($data['seq'])) {
+    if (!isset($raw[1]) || !is_numeric($raw[1])) {
         throw new RuntimeException('В Redis отсутствует курсор сообщений');
     }
 
     $seqs = [];
-    if (isset($data['seqs']) && is_array($data['seqs'])) {
-        $seqs = $data['seqs'];
+    if (isset($raw[2]) && is_array($raw[2])) {
+        $seqs = $raw[2];
     }
     $payloads = [];
-    if (isset($data['payloads']) && is_array($data['payloads'])) {
-        $payloads = $data['payloads'];
+    if (isset($raw[3]) && is_array($raw[3])) {
+        $payloads = $raw[3];
+    }
+    $usersRaw = [];
+    if (isset($raw[4]) && is_array($raw[4])) {
+        $usersRaw = $raw[4];
     }
 
     $messages = [];
@@ -435,6 +453,11 @@ LUA;
         }
         $message = json_decode($payloads[$index], true);
         if (!is_array($message)) {
+            // Битая строка — не отказ состояния: пропускаем её и пишем в лог,
+            // остальная история остаётся собранной. 500 тут быть не должно.
+            if (function_exists('chat_log_line')) {
+                chat_log_line('error', 'chat_snapshot: пропущено битое сообщение seq=' . (int) $seq);
+            }
             continue;
         }
         $message['seq'] = (int) $seq;
@@ -442,16 +465,21 @@ LUA;
     }
 
     $users = [];
-    if (isset($data['users']) && is_array($data['users'])) {
-        foreach ($data['users'] as $name) {
-            $users[] = (string) $name;
+    foreach ($usersRaw as $name) {
+        $userName = (string) $name;
+        if (!mb_check_encoding($userName, 'UTF-8')) {
+            if (function_exists('chat_log_line')) {
+                chat_log_line('error', 'chat_snapshot: пропущено битое имя в списке пользователей');
+            }
+            continue;
         }
+        $users[] = $userName;
     }
     sort($users, SORT_STRING);
 
     return [
-        'epoch' => $data['epoch'],
-        'seq' => (int) $data['seq'],
+        'epoch' => $raw[0],
+        'seq' => (int) $raw[1],
         'messages' => $messages,
         'users' => $users,
     ];
